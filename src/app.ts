@@ -36,8 +36,8 @@ function rateLimiter(req: Request, res: Response, next: NextFunction): void {
   if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
     logger.warn(
       {
-        hotelId: (req.body?.hotelId as string) || "unknown",
-        shiftDate: (req.body?.shiftDate as string) || "unknown",
+        hotelId: (req.body?.hotelId as string) || (req.query?.hotelId as string) || "unknown",
+        shiftDate: (req.body?.shiftDate as string) || (req.query?.shiftDate as string) || "unknown",
         step: "output",
         meta: { ip, requestCount: record.count },
       },
@@ -59,30 +59,23 @@ const RequestSchema = z.object({
   shiftDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Format must be YYYY-MM-DD"),
 });
 
-// GET /health endpoint (rate limited)
-app.get("/health", rateLimiter, (_req: Request, res: Response) => {
-  res.status(200).json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// POST /handover endpoint (rate limited)
-app.post("/handover", rateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+// Main processing pipeline shared between GET and POST /handover
+async function processHandover(
+  hotelId: string,
+  shiftDate: string,
+  formatType: "html" | "json",
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   const step = "ingestion";
-  let hotelId = "unknown";
-  let shiftDate = "unknown";
+
+  if (hotelId !== "lumen-sg") {
+    res.status(404).json({ error: `Hotel '${hotelId}' not found. Supported hotel is 'lumen-sg'.` });
+    return;
+  }
 
   try {
-    const parsedBody = RequestSchema.parse(req.body);
-    hotelId = parsedBody.hotelId;
-    shiftDate = parsedBody.shiftDate;
-
-    if (hotelId !== "lumen-sg") {
-      res.status(404).json({ error: `Hotel '${hotelId}' not found. Supported hotel is 'lumen-sg'.` });
-      return;
-    }
-
     const startTime = Date.now();
     logger.info({ hotelId, shiftDate, step }, "Starting handover request processing");
 
@@ -232,10 +225,6 @@ app.post("/handover", rateLimiter, async (req: Request, res: Response, next: Nex
     }
 
     // 5. Output rendering
-    const formatParam = req.query.format as string;
-    const acceptHeader = req.headers.accept || "";
-    const formatType = (formatParam === "html" || acceptHeader.includes("text/html")) ? "html" : "json";
-
     const formattedOutput = formatHandover(validated, formatType, hotelName, shiftDate);
 
     if (formatType === "html") {
@@ -250,6 +239,51 @@ app.post("/handover", rateLimiter, async (req: Request, res: Response, next: Nex
       { hotelId, shiftDate, step: "output", durationMs: totalDuration },
       "Handover request completed successfully"
     );
+  } catch (err: any) {
+    next(err);
+  }
+}
+
+// Redirect root URL to /handover?format=html for easy browser preview
+app.get("/", rateLimiter, (_req: Request, res: Response) => {
+  res.redirect("/handover?format=html");
+});
+
+// GET /health endpoint (rate limited)
+app.get("/health", rateLimiter, (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// GET /handover endpoint for direct browser preview
+app.get("/handover", rateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const hotelId = (req.query.hotelId as string) || "lumen-sg";
+  const shiftDate = (req.query.shiftDate as string) || "2026-05-27";
+  const formatParam = req.query.format as string;
+  const acceptHeader = req.headers.accept || "";
+
+  // For GET requests, default to "html" preview unless specified
+  const formatType = (formatParam === "json" || acceptHeader.includes("application/json")) ? "json" : "html";
+
+  await processHandover(hotelId, shiftDate, formatType, req, res, next);
+});
+
+// POST /handover endpoint (rate limited)
+app.post("/handover", rateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const parsedBody = RequestSchema.parse(req.body);
+    const hotelId = parsedBody.hotelId;
+    const shiftDate = parsedBody.shiftDate;
+
+    const formatParam = req.query.format as string;
+    const acceptHeader = req.headers.accept || "";
+
+    // For POST requests, default to "json" unless specified
+    const formatType = (formatParam === "html" || acceptHeader.includes("text/html")) ? "html" : "json";
+
+    await processHandover(hotelId, shiftDate, formatType, req, res, next);
   } catch (err: any) {
     if (err instanceof z.ZodError) {
       res.status(400).json({ error: "Invalid request body", details: err.issues });
